@@ -66,6 +66,10 @@ local NPCController = {}
 NPCController.__index = NPCController
 
 -- create a new npc controller instance
+-- the constructor initializes all runtime values used by the ai controller
+-- these values track patrol progress chase state pathfinding data stuck recovery
+-- and movement behavior patrol points are collected from the workspace and sorted
+-- by name so the npc follows a consistent and predictable patrol route
 function NPCController.new()
 	local self = setmetatable({}, NPCController)
 
@@ -154,7 +158,10 @@ function NPCController:GetPlayerCharacter(player)
 	return character, targetHumanoid, targetRoot
 end
 
--- check if npc has line of sight to the player using raycasting
+-- this function uses a raycast from the npc head toward the target root part
+-- to confirm real visibility this prevents the npc from detecting players through
+-- walls or other map geometry the npc model itself is excluded from the raycast
+-- filter so the visibility check is not blocked by its own body parts
 function NPCController:HasLineOfSight(targetRoot)
 	local origin = head.Position + CONFIG.LineOfSightHeightOffset
 	local direction = targetRoot.Position - origin
@@ -194,7 +201,10 @@ function NPCController:FindClosestVisiblePlayer()
 	return closestPlayer
 end
 
--- compute a path to a destination using roblox pathfinding
+-- this function creates and computes a path from the npc current position to a
+-- destination using roblox pathfindingservice agent settings are configured so the
+-- generated path matches the npc physical size and jump ability if path creation
+-- fails or the result is unusable nil is returned so the caller can recover safely
 function NPCController:ComputePath(destination)
 	local path = PathfindingService:CreatePath({
 		AgentRadius = 1.5,
@@ -513,7 +523,11 @@ function NPCController:UpdatePathChase(targetGroundPosition)
 	self:StartPathChase(chasePosition)
 end
 
--- main chase logic
+-- this is the main chase state update the npc validates the target checks whether
+-- the target is still within the allowed chase range attempts attacks when close
+-- enough and decides whether to use direct movement or pathfinding direct chase is
+-- used for nearby visible targets to make movement feel more responsive while path
+-- chase is used when the target is farther away or blocked by obstacles
 function NPCController:UpdateChase()
 	if not self.Target then
 		self:StartPatrol()
@@ -568,7 +582,10 @@ function NPCController:UpdateChase()
 	end
 end
 
--- detect when npc gets stuck and recover
+-- this recovery system checks whether the npc has stopped making meaningful movement
+-- progress for too long if the npc appears stuck its current movement is reset and
+-- recalculated during chase this helps recover from failed paths or collisions and
+-- during patrol it helps the npc continue moving if it becomes caught on geometry
 function NPCController:CheckIfStuck()
 	local movementDelta = (root.Position - self.LastPosition).Magnitude
 
@@ -614,7 +631,10 @@ function NPCController:CheckIfStuck()
 	self.LastPosition = root.Position
 end
 
--- main update loop executed every frame
+-- this function runs every frame and acts as the main ai update loop it handles
+-- target acquisition chase behavior auto jumping and stuck detection separating
+-- these systems into one update flow keeps the ai behavior consistent and easier
+-- to maintain
 function NPCController:Update()
 	if not self:IsAlive() then
 		return
