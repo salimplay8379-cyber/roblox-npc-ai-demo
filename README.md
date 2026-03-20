@@ -1,7 +1,7 @@
 ## Code Example
 
 ```lua
--- Example of NPC detection and behavior
+-- Example of npc detection and behavior
 if self:CanSeePlayer(target) then
     self:Chase(target)
 else
@@ -11,7 +11,7 @@ end
 
 ## Features Breakdown
 
-- Modular AI system (clean and expandable)
+- Modular ai system (clean and expandable)
 - Uses PathfindingService for navigation
 - Line-of-sight detection using raycasting
 - State-based behavior (patrol, chase, attack)
