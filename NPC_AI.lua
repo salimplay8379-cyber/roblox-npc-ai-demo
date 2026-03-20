@@ -1,10 +1,10 @@
 -- enemy npc ai demo script
 -- created as a scripting portfolio example
 
--- this script controls an npc that can patrol the map and detect nearby players
--- when a player is detected the npc will chase them using roblox pathfinding
+-- this script controls an npc that patrols the map and detects nearby players
+-- when a player is detected the npc chases them using roblox pathfinding
 
--- main systems included:
+-- main systems included
 -- patrol system using patrol points
 -- player detection with line of sight checks
 -- pathfinding navigation around walls and obstacles
@@ -12,8 +12,8 @@
 -- attack system when the npc is close to the player
 -- stuck detection and automatic path recovery
 
--- the goal of this script is to demonstrate ai behavior,
--- pathfinding logic, and basic enemy mechanics in roblox
+-- the goal of this script is to demonstrate ai behavior
+-- pathfinding logic and basic enemy mechanics in roblox
 
 -- get roblox services used by the npc ai system
 local Players = game:GetService("Players")
@@ -52,7 +52,7 @@ local CONFIG = {
 	AutoJumpHeight = 2.5,
 	AutoJumpCooldown = 0.25,
 
-	-- chase behaviour tuning
+	-- chase behavior tuning
 	DirectChaseRange = 10,
 	ChaseSwitchCooldown = 0.6,
 	DirectMoveRefresh = 0.35,
@@ -90,7 +90,7 @@ function NPCController.new()
 	self.LastSeenPosition = nil
 	self.LastJumpTime = 0
 
-	-- chase mode system
+	-- chase mode values
 	self.ChaseMode = "Path"
 	self.LastChaseModeSwitch = 0
 	self.LastDirectTargetPosition = nil
@@ -111,24 +111,25 @@ function NPCController.new()
 	return self
 end
 
--- debug print helper used when debug mode is enabled
+-- print debug information when debug mode is enabled
 function NPCController:DebugPrint(...)
 	if CONFIG.Debug then
 		print("[npc debug]:", ...)
 	end
 end
 
--- check if the npc is alive and still in the world
+-- check whether the npc is alive and still exists in the workspace
 function NPCController:IsAlive()
 	return humanoid.Health > 0 and npcModel.Parent ~= nil
 end
 
--- get distance between npc and a position
+-- get the distance between the npc and a position
 function NPCController:GetDistanceFrom(position)
 	return (root.Position - position).Magnitude
 end
 
--- convert a target position into a ground position so jumping players do not break chase
+-- convert a target position into a ground level chase position
+-- this helps keep chasing stable when players jump or move vertically
 function NPCController:GetGroundChasePosition(targetPosition)
 	return Vector3.new(targetPosition.X, root.Position.Y, targetPosition.Z)
 end
@@ -231,14 +232,14 @@ function NPCController:ComputePath(destination)
 	return path
 end
 
--- store path waypoints
+-- store the current path and its waypoints
 function NPCController:SetPath(path)
 	self.CurrentPath = path
 	self.CurrentWaypoints = path:GetWaypoints()
 	self.CurrentWaypointIndex = 1
 end
 
--- disconnect move connections to avoid duplicates
+-- disconnect movement connections to avoid duplicates
 function NPCController:ClearMoveConnection()
 	if self.MoveConnection then
 		self.MoveConnection:Disconnect()
@@ -246,7 +247,7 @@ function NPCController:ClearMoveConnection()
 	end
 end
 
--- stop the npc's current path
+-- stop the npc current path and clear waypoint data
 function NPCController:StopCurrentPath()
 	self:ClearMoveConnection()
 	self.CurrentPath = nil
@@ -255,7 +256,7 @@ function NPCController:StopCurrentPath()
 	humanoid:Move(Vector3.zero)
 end
 
--- move npc to the next waypoint in the path
+-- move the npc to the next waypoint in the current path
 function NPCController:MoveToNextWaypoint()
 	if not self.CurrentWaypoints or #self.CurrentWaypoints == 0 then
 		return
@@ -314,7 +315,7 @@ function NPCController:TryAutoJump()
 	self.LastJumpTime = time()
 end
 
--- start path chase movement toward a destination
+-- begin path based chase movement toward a destination
 function NPCController:StartPathChase(destination)
 	local path = self:ComputePath(destination)
 	if not path then
@@ -339,7 +340,7 @@ function NPCController:StartPathChase(destination)
 	end)
 end
 
--- move npc between patrol points
+-- move the npc between patrol points
 function NPCController:GoToPatrolPoint()
 	if #self.PatrolPoints == 0 then
 		return
@@ -385,7 +386,7 @@ function NPCController:GoToPatrolPoint()
 	end)
 end
 
--- change npc state
+-- change the npc state
 function NPCController:SetState(newState)
 	if self.State == newState then
 		return
@@ -431,12 +432,12 @@ function NPCController:StartChase(player)
 	self:DebugPrint("chasing player:", player.Name)
 end
 
--- check if npc can attack again
+-- check whether the npc can attack again
 function NPCController:CanAttack()
 	return (time() - self.LastAttackTime) >= CONFIG.AttackCooldown
 end
 
--- damage player when within attack range
+-- damage the player when within attack range
 function NPCController:AttackTarget()
 	if not self.Target then
 		return
@@ -454,7 +455,7 @@ function NPCController:AttackTarget()
 	end
 end
 
--- check if npc should start chasing a player
+-- check whether the npc should begin chasing a player
 function NPCController:CheckForTarget()
 	if self.State ~= "Patrol" then
 		return
@@ -500,7 +501,7 @@ function NPCController:UpdateDirectChase(targetRoot, targetGroundPosition)
 	end
 end
 
--- update path chase movement
+-- update path based chase movement
 function NPCController:UpdatePathChase(targetGroundPosition)
 	if time() - self.LastRepathTime < CONFIG.RepathInterval then
 		return
@@ -650,17 +651,17 @@ function NPCController:Update()
 	self:CheckIfStuck()
 end
 
--- destroy controller when npc dies
+-- destroy the controller when the npc dies
 function NPCController:Destroy()
 	self.Destroyed = true
 	self:ClearMoveConnection()
 end
 
--- create controller and start patrol behavior
+-- create the controller and start patrol behavior
 local controller = NPCController.new()
 controller:StartPatrol()
 
--- update npc every frame
+-- update the npc every frame
 local heartbeatConnection
 heartbeatConnection = RunService.Heartbeat:Connect(function()
 	if not controller:IsAlive() then
@@ -672,7 +673,7 @@ heartbeatConnection = RunService.Heartbeat:Connect(function()
 	controller:Update()
 end)
 
--- cleanup when npc dies
+-- clean up when the npc dies
 humanoid.Died:Connect(function()
 	controller:Destroy()
 end)
