@@ -1,141 +1,110 @@
--- enemy npc ai demo script
--- created as a scripting portfolio example
+-- npc patrol and chase script
 
--- this script controls an npc that patrols the map and detects nearby players
--- when a player is detected the npc chases them using roblox pathfinding
-
--- main systems included
--- patrol system using patrol points
--- player detection with line of sight checks
--- pathfinding navigation around walls and obstacles
--- auto jump system for small obstacles
--- attack system when the npc is close to the player
--- stuck detection and automatic path recovery
-
--- the goal of this script is to demonstrate ai behavior
--- pathfinding logic and basic enemy mechanics in roblox
-
--- get roblox services used by the npc ai system
 local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
--- reference the npc model and its important parts
 local npcModel = script.Parent
 local humanoid = npcModel:WaitForChild("Humanoid")
 local root = npcModel:WaitForChild("HumanoidRootPart")
 local head = npcModel:WaitForChild("Head")
+local patrolFolder = Workspace.PatrolPoints
 
--- folder containing patrol points placed in the map
-local patrolFolder = Workspace:WaitForChild("PatrolPoints")
-
--- configuration values controlling npc behavior
-local CONFIG = {
-	DetectionRange = 70,
+local config = {
+	DetectionRange = 60,
 	AttackRange = 5,
-	LoseTargetRange = 100,
+	LoseRange = 100,
 	PatrolWaitTime = 1.5,
+
+	-- lower felt too twitchy because it kept rebuilding paths
 	RepathInterval = 0.8,
+
 	AttackCooldown = 1.2,
-	Damage = 15,
+	Damage = 12,
 	WalkSpeed = 10,
 	ChaseSpeed = 16,
-	LineOfSightHeightOffset = Vector3.new(0, 2, 0),
+	SightOffset = Vector3.new(0, 2, 0),
 	StuckThreshold = 1.5,
 	StuckTime = 1.5,
-	Debug = true,
+	Debug = false,
 
-	-- auto jump system configuration
 	AutoJumpEnabled = true,
-	AutoJumpCheckDistance = 5,
+	AutoJumpDist = 5,
 	AutoJumpHeight = 2.5,
 	AutoJumpCooldown = 0.25,
 
-	-- chase behavior tuning
+	-- close range felt better with direct movement instead of full pathing
 	DirectChaseRange = 10,
 	ChaseSwitchCooldown = 0.6,
 	DirectMoveRefresh = 0.35,
-	DirectPredictionAmount = 0.12,
-	DirectMoveMinimumDistance = 2,
-	PathRepathMinimumDistance = 3,
+	DirectPrediction = 0.12,
+	DirectMoveMinDist = 2,
+	RepathMinDist = 3,
+
+	-- if the npc loses the player it checks the last seen spot first
+	-- this felt better than snapping straight back into patrol
+	UseInvestigateMode = true,
+	InvestigateWaitTime = 1.5,
 }
 
--- npc controller class
-local NPCController = {}
-NPCController.__index = NPCController
+local state = {
+	Mode = "Patrol",
+	Target = nil,
 
--- create a new npc controller instance
--- the constructor initializes all runtime values used by the ai controller
--- these values track patrol progress chase state pathfinding data stuck recovery
--- and movement behavior patrol points are collected from the workspace and sorted
--- by name so the npc follows a consistent and predictable patrol route
-function NPCController.new()
-	local self = setmetatable({}, NPCController)
+	LastAttackTime = 0,
+	LastRepathTime = 0,
+	LastJumpTime = 0,
 
-	-- initial npc state values
-	self.State = "Patrol"
-	self.Target = nil
-	self.LastAttackTime = 0
-	self.LastRepathTime = 0
-	self.CurrentPatrolIndex = 1
-	self.PatrolPoints = {}
-	self.CurrentPath = nil
-	self.CurrentWaypoints = {}
-	self.CurrentWaypointIndex = 1
-	self.MoveConnection = nil
-	self.StuckStartTime = nil
-	self.LastPosition = root.Position
-	self.Destroyed = false
-	self.LastSeenPosition = nil
-	self.LastJumpTime = 0
+	CurrentPatrolIndex = 1,
+	PatrolPoints = {},
 
-	-- chase mode values
-	self.ChaseMode = "Path"
-	self.LastChaseModeSwitch = 0
-	self.LastDirectTargetPosition = nil
-	self.LastPathTargetPosition = nil
+	CurrentPath = nil,
+	CurrentWaypoints = {},
+	CurrentWaypointIndex = 1,
+	MoveConnection = nil,
 
-	-- collect patrol points from the folder
-	for _, point in ipairs(patrolFolder:GetChildren()) do
-		if point:IsA("BasePart") then
-			table.insert(self.PatrolPoints, point)
-		end
-	end
+	StuckStartTime = nil,
+	LastPosition = root.Position,
+	LastSeenPosition = nil,
 
-	-- sort patrol points by name so they are visited in order
-	table.sort(self.PatrolPoints, function(a, b)
-		return a.Name < b.Name
-	end)
+	ChaseMode = "Path",
+	LastChaseModeSwitch = 0,
+	LastDirectTargetPosition = nil,
+	LastPathTargetPosition = nil,
 
-	return self
-end
+	Investigating = false,
+	InvestigateStartedAt = 0,
 
--- print debug information when debug mode is enabled
-function NPCController:DebugPrint(...)
-	if CONFIG.Debug then
-		print("[npc debug]:", ...)
+	Destroyed = false,
+}
+
+local function debugPrint(...)
+	if config.Debug then
+		print("[npc]", ...)
 	end
 end
 
--- check whether the npc is alive and still exists in the workspace
-function NPCController:IsAlive()
+local function isAlive()
 	return humanoid.Health > 0 and npcModel.Parent ~= nil
 end
 
--- get the distance between the npc and a position
-function NPCController:GetDistanceFrom(position)
-	return (root.Position - position).Magnitude
+local function clearMoveConnection()
+	if state.MoveConnection then
+		state.MoveConnection:Disconnect()
+		state.MoveConnection = nil
+	end
 end
 
--- convert a target position into a ground level chase position
--- this helps keep chasing stable when players jump or move vertically
-function NPCController:GetGroundChasePosition(targetPosition)
-	return Vector3.new(targetPosition.X, root.Position.Y, targetPosition.Z)
+local function stopCurrentPath()
+	clearMoveConnection()
+	state.CurrentPath = nil
+	state.CurrentWaypoints = {}
+	state.CurrentWaypointIndex = 1
+	humanoid:Move(Vector3.zero)
 end
 
--- get a player's character and important components
-function NPCController:GetPlayerCharacter(player)
+local function getPlayerParts(player)
 	if not player then
 		return nil
 	end
@@ -159,17 +128,19 @@ function NPCController:GetPlayerCharacter(player)
 	return character, targetHumanoid, targetRoot
 end
 
--- this function uses a raycast from the npc head toward the target root part
--- to confirm real visibility this prevents the npc from detecting players through
--- walls or other map geometry the npc model itself is excluded from the raycast
--- filter so the visibility check is not blocked by its own body parts
-function NPCController:HasLineOfSight(targetRoot)
-	local origin = head.Position + CONFIG.LineOfSightHeightOffset
+local function getGroundTargetPosition(position)
+	-- keeping the npc on its current Y stops weird chase behavior when players jump
+	return Vector3.new(position.X, root.Position.Y, position.Z)
+end
+
+local function hasLineOfSight(targetRoot)
+	-- cast from the head so walls block vision properly
+	local origin = head.Position + config.SightOffset
 	local direction = targetRoot.Position - origin
 
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-	rayParams.FilterDescendantsInstances = {npcModel}
+	rayParams.FilterDescendantsInstances = { npcModel }
 	rayParams.IgnoreWater = true
 
 	local result = Workspace:Raycast(origin, direction, rayParams)
@@ -181,18 +152,17 @@ function NPCController:HasLineOfSight(targetRoot)
 	return result.Instance:IsDescendantOf(targetRoot.Parent)
 end
 
--- find the closest visible player within detection range
-function NPCController:FindClosestVisiblePlayer()
+local function findClosestVisiblePlayer()
 	local closestPlayer = nil
-	local closestDistance = CONFIG.DetectionRange
+	local closestDistance = config.DetectionRange
 
 	for _, player in ipairs(Players:GetPlayers()) do
-		local character, _, targetRoot = self:GetPlayerCharacter(player)
+		local character, _, targetRoot = getPlayerParts(player)
 
 		if character and targetRoot then
-			local distance = self:GetDistanceFrom(targetRoot.Position)
+			local distance = (root.Position - targetRoot.Position).Magnitude
 
-			if distance <= closestDistance and self:HasLineOfSight(targetRoot) then
+			if distance <= closestDistance and hasLineOfSight(targetRoot) then
 				closestDistance = distance
 				closestPlayer = player
 			end
@@ -202,11 +172,7 @@ function NPCController:FindClosestVisiblePlayer()
 	return closestPlayer
 end
 
--- this function creates and computes a path from the npc current position to a
--- destination using roblox pathfindingservice agent settings are configured so the
--- generated path matches the npc physical size and jump ability if path creation
--- fails or the result is unusable nil is returned so the caller can recover safely
-function NPCController:ComputePath(destination)
+local function buildPath(destination)
 	local path = PathfindingService:CreatePath({
 		AgentRadius = 1.5,
 		AgentHeight = 5,
@@ -215,58 +181,39 @@ function NPCController:ComputePath(destination)
 		AgentMaxSlope = 45,
 	})
 
-	local success, errorMessage = pcall(function()
+	local ok, err = pcall(function()
 		path:ComputeAsync(root.Position, destination)
 	end)
 
-	if not success then
-		self:DebugPrint("path computation failed:", errorMessage)
+	if not ok then
+		debugPrint("path computation failed", err)
 		return nil
 	end
 
 	if path.Status ~= Enum.PathStatus.Success then
-		self:DebugPrint("path status not successful:", path.Status.Name)
+		debugPrint("path failed with status", path.Status.Name)
 		return nil
 	end
 
 	return path
 end
 
--- store the current path and its waypoints
-function NPCController:SetPath(path)
-	self.CurrentPath = path
-	self.CurrentWaypoints = path:GetWaypoints()
-	self.CurrentWaypointIndex = 1
+local function usePath(path)
+	state.CurrentPath = path
+	state.CurrentWaypoints = path:GetWaypoints()
+	state.CurrentWaypointIndex = 1
 end
 
--- disconnect movement connections to avoid duplicates
-function NPCController:ClearMoveConnection()
-	if self.MoveConnection then
-		self.MoveConnection:Disconnect()
-		self.MoveConnection = nil
-	end
-end
-
--- stop the npc current path and clear waypoint data
-function NPCController:StopCurrentPath()
-	self:ClearMoveConnection()
-	self.CurrentPath = nil
-	self.CurrentWaypoints = {}
-	self.CurrentWaypointIndex = 1
-	humanoid:Move(Vector3.zero)
-end
-
--- move the npc to the next waypoint in the current path
-function NPCController:MoveToNextWaypoint()
-	if not self.CurrentWaypoints or #self.CurrentWaypoints == 0 then
+local function moveToNextWaypoint()
+	if #state.CurrentWaypoints == 0 then
 		return
 	end
 
-	if self.CurrentWaypointIndex > #self.CurrentWaypoints then
+	if state.CurrentWaypointIndex > #state.CurrentWaypoints then
 		return
 	end
 
-	local waypoint = self.CurrentWaypoints[self.CurrentWaypointIndex]
+	local waypoint = state.CurrentWaypoints[state.CurrentWaypointIndex]
 
 	if waypoint.Action == Enum.PathWaypointAction.Jump then
 		humanoid.Jump = true
@@ -275,13 +222,12 @@ function NPCController:MoveToNextWaypoint()
 	humanoid:MoveTo(waypoint.Position)
 end
 
--- detect small obstacles in front of the npc and jump over them
-function NPCController:TryAutoJump()
-	if not CONFIG.AutoJumpEnabled then
+local function tryAutoJump()
+	if not config.AutoJumpEnabled then
 		return
 	end
 
-	if time() - self.LastJumpTime < CONFIG.AutoJumpCooldown then
+	if time() - state.LastJumpTime < config.AutoJumpCooldown then
 		return
 	end
 
@@ -292,10 +238,10 @@ function NPCController:TryAutoJump()
 
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
-	rayParams.FilterDescendantsInstances = {npcModel}
+	rayParams.FilterDescendantsInstances = { npcModel }
 	rayParams.IgnoreWater = true
 
-	local forward = moveDirection.Unit * CONFIG.AutoJumpCheckDistance
+	local forward = moveDirection.Unit * config.AutoJumpDist
 
 	local lowOrigin = root.Position + Vector3.new(0, 1, 0)
 	local lowHit = Workspace:Raycast(lowOrigin, forward, rayParams)
@@ -304,7 +250,7 @@ function NPCController:TryAutoJump()
 		return
 	end
 
-	local highOrigin = root.Position + Vector3.new(0, CONFIG.AutoJumpHeight, 0)
+	local highOrigin = root.Position + Vector3.new(0, config.AutoJumpHeight, 0)
 	local highHit = Workspace:Raycast(highOrigin, forward, rayParams)
 
 	if highHit then
@@ -312,181 +258,203 @@ function NPCController:TryAutoJump()
 	end
 
 	humanoid.Jump = true
-	self.LastJumpTime = time()
+	state.LastJumpTime = time()
 end
 
--- begin path based chase movement toward a destination
-function NPCController:StartPathChase(destination)
-	local path = self:ComputePath(destination)
+local function setMode(newMode)
+	if state.Mode == newMode then
+		return
+	end
+
+	debugPrint("state", state.Mode, "->", newMode)
+	state.Mode = newMode
+end
+
+local goToPatrolPoint
+local startPatrol
+local startPathChase
+
+startPathChase = function(destination)
+	local path = buildPath(destination)
 	if not path then
 		return
 	end
 
-	self:SetPath(path)
-	self:ClearMoveConnection()
-	self:MoveToNextWaypoint()
+	usePath(path)
+	clearMoveConnection()
+	moveToNextWaypoint()
 
-	self.MoveConnection = humanoid.MoveToFinished:Connect(function(reached)
-		if self.Destroyed or self.State ~= "Chase" or self.ChaseMode ~= "Path" then
+	state.MoveConnection = humanoid.MoveToFinished:Connect(function(reached)
+		if state.Destroyed or state.Mode ~= "Chase" and state.Mode ~= "Investigate" or state.ChaseMode ~= "Path" and state.Mode ~= "Investigate" then
 			return
 		end
 
 		if reached then
-			self.CurrentWaypointIndex += 1
-			if self.CurrentWaypointIndex <= #self.CurrentWaypoints then
-				self:MoveToNextWaypoint()
+			state.CurrentWaypointIndex += 1
+			if state.CurrentWaypointIndex <= #state.CurrentWaypoints then
+				moveToNextWaypoint()
 			end
 		end
 	end)
 end
 
--- move the npc between patrol points
-function NPCController:GoToPatrolPoint()
-	if #self.PatrolPoints == 0 then
+goToPatrolPoint = function()
+	if #state.PatrolPoints == 0 then
 		return
 	end
 
-	local patrolPoint = self.PatrolPoints[self.CurrentPatrolIndex]
-	self:DebugPrint("patrolling to", patrolPoint.Name)
+	local patrolPoint = state.PatrolPoints[state.CurrentPatrolIndex]
+	debugPrint("patrolling to", patrolPoint.Name)
 
-	local path = self:ComputePath(patrolPoint.Position)
+	local path = buildPath(patrolPoint.Position)
 	if not path then
 		return
 	end
 
-	self:SetPath(path)
-	self:ClearMoveConnection()
-	self:MoveToNextWaypoint()
+	usePath(path)
+	clearMoveConnection()
+	moveToNextWaypoint()
 
-	self.MoveConnection = humanoid.MoveToFinished:Connect(function(reached)
-		if self.Destroyed or self.State ~= "Patrol" then
+	state.MoveConnection = humanoid.MoveToFinished:Connect(function(reached)
+		if state.Destroyed or state.Mode ~= "Patrol" then
 			return
 		end
 
 		if reached then
-			self.CurrentWaypointIndex += 1
+			state.CurrentWaypointIndex += 1
 
-			if self.CurrentWaypointIndex <= #self.CurrentWaypoints then
-				self:MoveToNextWaypoint()
+			if state.CurrentWaypointIndex <= #state.CurrentWaypoints then
+				moveToNextWaypoint()
 			else
-				task.delay(CONFIG.PatrolWaitTime, function()
-					if self.Destroyed or self.State ~= "Patrol" then
+				task.delay(config.PatrolWaitTime, function()
+					if state.Destroyed or state.Mode ~= "Patrol" then
 						return
 					end
 
-					self.CurrentPatrolIndex += 1
-					if self.CurrentPatrolIndex > #self.PatrolPoints then
-						self.CurrentPatrolIndex = 1
+					state.CurrentPatrolIndex += 1
+					if state.CurrentPatrolIndex > #state.PatrolPoints then
+						state.CurrentPatrolIndex = 1
 					end
 
-					self:GoToPatrolPoint()
+					goToPatrolPoint()
 				end)
 			end
 		end
 	end)
 end
 
--- change the npc state
-function NPCController:SetState(newState)
-	if self.State == newState then
-		return
-	end
+startPatrol = function()
+	stopCurrentPath()
 
-	self:DebugPrint("state changed from", self.State, "to", newState)
-	self.State = newState
+	state.Target = nil
+	state.LastSeenPosition = nil
+	state.LastDirectTargetPosition = nil
+	state.LastPathTargetPosition = nil
+	state.Investigating = false
+	state.InvestigateStartedAt = 0
+
+	state.ChaseMode = "Path"
+	state.LastChaseModeSwitch = 0
+
+	humanoid.WalkSpeed = config.WalkSpeed
+	setMode("Patrol")
+	goToPatrolPoint()
 end
 
--- start npc patrol behavior
-function NPCController:StartPatrol()
-	self:StopCurrentPath()
-	self.Target = nil
-	self.LastSeenPosition = nil
-	self.LastDirectTargetPosition = nil
-	self.LastPathTargetPosition = nil
-	self.ChaseMode = "Path"
-	self.LastChaseModeSwitch = 0
-	humanoid.WalkSpeed = CONFIG.WalkSpeed
-	self:SetState("Patrol")
-	self:GoToPatrolPoint()
-end
+local function startChase(player)
+	stopCurrentPath()
 
--- begin chasing a player
-function NPCController:StartChase(player)
-	self:StopCurrentPath()
-	self.Target = player
-	self.LastDirectTargetPosition = nil
-	self.LastPathTargetPosition = nil
-	self.ChaseMode = "Path"
-	self.LastChaseModeSwitch = time()
+	state.Target = player
+	state.Investigating = false
+	state.InvestigateStartedAt = 0
+	state.LastDirectTargetPosition = nil
+	state.LastPathTargetPosition = nil
+	state.ChaseMode = "Path"
+	state.LastChaseModeSwitch = time()
 
-	local _, _, targetRoot = self:GetPlayerCharacter(player)
+	local _, _, targetRoot = getPlayerParts(player)
 	if targetRoot then
-		self.LastSeenPosition = self:GetGroundChasePosition(targetRoot.Position)
+		state.LastSeenPosition = getGroundTargetPosition(targetRoot.Position)
 	else
-		self.LastSeenPosition = nil
+		state.LastSeenPosition = nil
 	end
 
-	humanoid.WalkSpeed = CONFIG.ChaseSpeed
-	self:SetState("Chase")
-	self.LastRepathTime = 0
-	self:DebugPrint("chasing player:", player.Name)
+	humanoid.WalkSpeed = config.ChaseSpeed
+	setMode("Chase")
+	state.LastRepathTime = 0
+	debugPrint("chasing", player.Name)
 end
 
--- check whether the npc can attack again
-function NPCController:CanAttack()
-	return (time() - self.LastAttackTime) >= CONFIG.AttackCooldown
-end
-
--- damage the player when within attack range
-function NPCController:AttackTarget()
-	if not self.Target then
+local function startInvestigate(lastPosition)
+	if not config.UseInvestigateMode or not lastPosition then
+		startPatrol()
 		return
 	end
 
-	local character, targetHumanoid, targetRoot = self:GetPlayerCharacter(self.Target)
+	stopCurrentPath()
+
+	state.Target = nil
+	state.Investigating = true
+	state.InvestigateStartedAt = 0
+	state.LastDirectTargetPosition = nil
+	state.LastPathTargetPosition = nil
+	state.ChaseMode = "Path"
+
+	humanoid.WalkSpeed = config.WalkSpeed
+	setMode("Investigate")
+	startPathChase(lastPosition)
+end
+
+local function canAttack()
+	return (time() - state.LastAttackTime) >= config.AttackCooldown
+end
+
+local function attackTarget()
+	if not state.Target then
+		return
+	end
+
+	local character, targetHumanoid, targetRoot = getPlayerParts(state.Target)
 	if not character or not targetHumanoid or not targetRoot then
 		return
 	end
 
-	if self:GetDistanceFrom(targetRoot.Position) <= CONFIG.AttackRange and self:CanAttack() then
-		self.LastAttackTime = time()
-		targetHumanoid:TakeDamage(CONFIG.Damage)
-		self:DebugPrint("attacked", self.Target.Name, "for", CONFIG.Damage, "damage")
+	if (root.Position - targetRoot.Position).Magnitude <= config.AttackRange and canAttack() then
+		state.LastAttackTime = time()
+		targetHumanoid:TakeDamage(config.Damage)
+		debugPrint("attacked", state.Target.Name, "for", config.Damage)
 	end
 end
 
--- check whether the npc should begin chasing a player
-function NPCController:CheckForTarget()
-	if self.State ~= "Patrol" then
+local function checkForTarget()
+	if state.Mode ~= "Patrol" and state.Mode ~= "Investigate" then
 		return
 	end
 
-	local visiblePlayer = self:FindClosestVisiblePlayer()
+	local visiblePlayer = findClosestVisiblePlayer()
 	if visiblePlayer then
-		self:StartChase(visiblePlayer)
+		startChase(visiblePlayer)
 	end
 end
 
--- update direct chase movement
-function NPCController:UpdateDirectChase(targetRoot, targetGroundPosition)
-	local shouldRefreshMove = time() - self.LastRepathTime >= CONFIG.DirectMoveRefresh
-	if not shouldRefreshMove then
+local function updateDirectChase(targetRoot, targetGroundPosition)
+	if time() - state.LastRepathTime < config.DirectMoveRefresh then
 		return
 	end
 
-	self.LastRepathTime = time()
+	state.LastRepathTime = time()
 
 	local predictedPosition = targetGroundPosition
 	local targetVelocity = targetRoot.AssemblyLinearVelocity
 	local flatVelocity = Vector3.new(targetVelocity.X, 0, targetVelocity.Z)
 
 	if flatVelocity.Magnitude > 1 then
-		predictedPosition += flatVelocity * CONFIG.DirectPredictionAmount
+		predictedPosition += flatVelocity * config.DirectPrediction
 	end
 
 	local movedEnough = true
-	if self.LastDirectTargetPosition then
-		local moveDelta = (predictedPosition - self.LastDirectTargetPosition).Magnitude
+	if state.LastDirectTargetPosition then
+		local moveDelta = (predictedPosition - state.LastDirectTargetPosition).Magnitude
 		movedEnough = moveDelta >= 1.5
 	end
 
@@ -494,186 +462,201 @@ function NPCController:UpdateDirectChase(targetRoot, targetGroundPosition)
 		return
 	end
 
-	self.LastDirectTargetPosition = predictedPosition
+	state.LastDirectTargetPosition = predictedPosition
 
-	if (predictedPosition - root.Position).Magnitude > CONFIG.DirectMoveMinimumDistance then
+	if (predictedPosition - root.Position).Magnitude > config.DirectMoveMinDist then
 		humanoid:MoveTo(predictedPosition)
 	end
 end
 
--- update path based chase movement
-function NPCController:UpdatePathChase(targetGroundPosition)
-	if time() - self.LastRepathTime < CONFIG.RepathInterval then
+local function updatePathChase(targetGroundPosition)
+	if time() - state.LastRepathTime < config.RepathInterval then
 		return
 	end
 
-	local chasePosition = self.LastSeenPosition or targetGroundPosition
+	local chasePosition = state.LastSeenPosition or targetGroundPosition
 
 	local movedEnough = true
-	if self.LastPathTargetPosition then
-		local moveDelta = (chasePosition - self.LastPathTargetPosition).Magnitude
-		movedEnough = moveDelta >= CONFIG.PathRepathMinimumDistance
+	if state.LastPathTargetPosition then
+		local moveDelta = (chasePosition - state.LastPathTargetPosition).Magnitude
+		movedEnough = moveDelta >= config.RepathMinDist
 	end
 
 	if not movedEnough then
 		return
 	end
 
-	self.LastRepathTime = time()
-	self.LastPathTargetPosition = chasePosition
-	self:StartPathChase(chasePosition)
+	state.LastRepathTime = time()
+	state.LastPathTargetPosition = chasePosition
+	startPathChase(chasePosition)
 end
 
--- this is the main chase state update the npc validates the target checks whether
--- the target is still within the allowed chase range attempts attacks when close
--- enough and decides whether to use direct movement or pathfinding direct chase is
--- used for nearby visible targets to make movement feel more responsive while path
--- chase is used when the target is farther away or blocked by obstacles
-function NPCController:UpdateChase()
-	if not self.Target then
-		self:StartPatrol()
+local function updateChase()
+	if not state.Target then
+		if state.LastSeenPosition then
+			startInvestigate(state.LastSeenPosition)
+		else
+			startPatrol()
+		end
 		return
 	end
 
-	local character, _, targetRoot = self:GetPlayerCharacter(self.Target)
+	local character, _, targetRoot = getPlayerParts(state.Target)
 	if not character or not targetRoot then
-		self:DebugPrint("lost target because character is invalid")
-		self:StartPatrol()
+		debugPrint("lost target because character is invalid")
+
+		if state.LastSeenPosition then
+			startInvestigate(state.LastSeenPosition)
+		else
+			startPatrol()
+		end
 		return
 	end
 
-	local targetGroundPosition = self:GetGroundChasePosition(targetRoot.Position)
-	local distance = self:GetDistanceFrom(targetGroundPosition)
+	local targetGroundPosition = getGroundTargetPosition(targetRoot.Position)
+	local distance = (root.Position - targetGroundPosition).Magnitude
 
-	if distance > CONFIG.LoseTargetRange then
-		self:DebugPrint("lost target due to distance")
-		self:StartPatrol()
+	if distance > config.LoseRange then
+		debugPrint("lost target due to distance")
+
+		if state.LastSeenPosition then
+			startInvestigate(state.LastSeenPosition)
+		else
+			startPatrol()
+		end
 		return
 	end
 
-	self:AttackTarget()
+	attackTarget()
 
-	local hasSight = self:HasLineOfSight(targetRoot)
-	local wantsDirectChase = hasSight and distance < CONFIG.DirectChaseRange
+	local hasSight = hasLineOfSight(targetRoot)
+	local wantsDirectChase = hasSight and distance < config.DirectChaseRange
 
 	if hasSight then
-		self.LastSeenPosition = targetGroundPosition
+		state.LastSeenPosition = targetGroundPosition
 	end
 
-	if wantsDirectChase and self.ChaseMode ~= "Direct" then
-		if time() - self.LastChaseModeSwitch >= CONFIG.ChaseSwitchCooldown then
-			self.ChaseMode = "Direct"
-			self.LastChaseModeSwitch = time()
-			self:StopCurrentPath()
-			self.LastDirectTargetPosition = nil
+	if wantsDirectChase and state.ChaseMode ~= "Direct" then
+		if time() - state.LastChaseModeSwitch >= config.ChaseSwitchCooldown then
+			state.ChaseMode = "Direct"
+			state.LastChaseModeSwitch = time()
+			stopCurrentPath()
+			state.LastDirectTargetPosition = nil
 		end
-	elseif not wantsDirectChase and self.ChaseMode ~= "Path" then
-		if time() - self.LastChaseModeSwitch >= CONFIG.ChaseSwitchCooldown then
-			self.ChaseMode = "Path"
-			self.LastChaseModeSwitch = time()
-			self:StopCurrentPath()
-			self.LastPathTargetPosition = nil
+	elseif not wantsDirectChase and state.ChaseMode ~= "Path" then
+		if time() - state.LastChaseModeSwitch >= config.ChaseSwitchCooldown then
+			state.ChaseMode = "Path"
+			state.LastChaseModeSwitch = time()
+			stopCurrentPath()
+			state.LastPathTargetPosition = nil
 		end
 	end
 
-	if self.ChaseMode == "Direct" then
-		self:UpdateDirectChase(targetRoot, targetGroundPosition)
+	if state.ChaseMode == "Direct" then
+		updateDirectChase(targetRoot, targetGroundPosition)
 	else
-		self:UpdatePathChase(targetGroundPosition)
+		updatePathChase(targetGroundPosition)
 	end
 end
 
--- this recovery system checks whether the npc has stopped making meaningful movement
--- progress for too long if the npc appears stuck its current movement is reset and
--- recalculated during chase this helps recover from failed paths or collisions and
--- during patrol it helps the npc continue moving if it becomes caught on geometry
-function NPCController:CheckIfStuck()
-	local movementDelta = (root.Position - self.LastPosition).Magnitude
+local function checkIfStuck()
+	-- if it sits almost still too long it probably got hung up on something
+	local movementDelta = (root.Position - state.LastPosition).Magnitude
 
-	if movementDelta < CONFIG.StuckThreshold then
-		if not self.StuckStartTime then
-			self.StuckStartTime = time()
-		elseif time() - self.StuckStartTime >= CONFIG.StuckTime then
-			self:DebugPrint("npc appears stuck, recomputing movement")
+	if movementDelta < config.StuckThreshold then
+		if not state.StuckStartTime then
+			state.StuckStartTime = time()
+		elseif time() - state.StuckStartTime >= config.StuckTime then
+			debugPrint("npc seems stuck, recalculating")
 
-			if self.State == "Chase" and self.Target then
-				local character, _, targetRoot = self:GetPlayerCharacter(self.Target)
+			if state.Mode == "Chase" and state.Target then
+				local character, _, targetRoot = getPlayerParts(state.Target)
 				if character and targetRoot then
-					self:StopCurrentPath()
+					stopCurrentPath()
 
-					local targetGroundPosition = self:GetGroundChasePosition(targetRoot.Position)
-					local hasSight = self:HasLineOfSight(targetRoot)
-					local distance = self:GetDistanceFrom(targetGroundPosition)
+					local targetGroundPosition = getGroundTargetPosition(targetRoot.Position)
+					local hasSight = hasLineOfSight(targetRoot)
+					local distance = (root.Position - targetGroundPosition).Magnitude
 
-					if hasSight and distance < CONFIG.DirectChaseRange then
-						self.ChaseMode = "Direct"
-						self.LastChaseModeSwitch = time()
-						self.LastDirectTargetPosition = nil
+					if hasSight and distance < config.DirectChaseRange then
+						state.ChaseMode = "Direct"
+						state.LastChaseModeSwitch = time()
+						state.LastDirectTargetPosition = nil
 						humanoid:MoveTo(targetGroundPosition)
 					else
-						self.ChaseMode = "Path"
-						self.LastChaseModeSwitch = time()
-						self.LastPathTargetPosition = nil
-						local chasePosition = self.LastSeenPosition or targetGroundPosition
-						self:StartPathChase(chasePosition)
+						state.ChaseMode = "Path"
+						state.LastChaseModeSwitch = time()
+						state.LastPathTargetPosition = nil
+						local chasePosition = state.LastSeenPosition or targetGroundPosition
+						startPathChase(chasePosition)
 					end
 				end
-			elseif self.State == "Patrol" and #self.PatrolPoints > 0 then
-				self:StopCurrentPath()
-				self:GoToPatrolPoint()
+			elseif state.Mode == "Investigate" and state.LastSeenPosition then
+				stopCurrentPath()
+				startPathChase(state.LastSeenPosition)
+			elseif state.Mode == "Patrol" and #state.PatrolPoints > 0 then
+				stopCurrentPath()
+				goToPatrolPoint()
 			end
 
-			self.StuckStartTime = nil
+			state.StuckStartTime = nil
 		end
 	else
-		self.StuckStartTime = nil
+		state.StuckStartTime = nil
 	end
 
-	self.LastPosition = root.Position
+	state.LastPosition = root.Position
 end
 
--- this function runs every frame and acts as the main ai update loop it handles
--- target acquisition chase behavior auto jumping and stuck detection separating
--- these systems into one update flow keeps the ai behavior consistent and easier
--- to maintain
-function NPCController:Update()
-	if not self:IsAlive() then
-		return
+-- I randomized patrol order instead of sorting by name
+-- makes movement feel less scripted and repetitive
+for _, point in ipairs(patrolFolder:GetChildren()) do
+	if point:IsA("BasePart") then
+		table.insert(state.PatrolPoints, point)
 	end
-
-	self:CheckForTarget()
-
-	if self.State == "Chase" then
-		self:UpdateChase()
-	end
-
-	self:TryAutoJump()
-	self:CheckIfStuck()
 end
 
--- destroy the controller when the npc dies
-function NPCController:Destroy()
-	self.Destroyed = true
-	self:ClearMoveConnection()
+-- shuffle patrol points so the npc path is less predictable
+for i = #state.PatrolPoints, 2, -1 do
+	local j = math.random(1, i)
+	state.PatrolPoints[i], state.PatrolPoints[j] = state.PatrolPoints[j], state.PatrolPoints[i]
 end
 
--- create the controller and start patrol behavior
-local controller = NPCController.new()
-controller:StartPatrol()
+startPatrol()
 
--- update the npc every frame
 local heartbeatConnection
 heartbeatConnection = RunService.Heartbeat:Connect(function()
-	if not controller:IsAlive() then
-		controller:Destroy()
+	if not isAlive() then
+		state.Destroyed = true
+		clearMoveConnection()
 		heartbeatConnection:Disconnect()
 		return
 	end
 
-	controller:Update()
+	checkForTarget()
+
+	if state.Mode == "Chase" then
+		updateChase()
+	end
+
+	if state.Mode == "Investigate" and state.LastSeenPosition then
+		if (root.Position - state.LastSeenPosition).Magnitude <= 4 then
+			if state.InvestigateStartedAt == 0 then
+				state.InvestigateStartedAt = time()
+			elseif time() - state.InvestigateStartedAt >= config.InvestigateWaitTime then
+				state.Investigating = false
+				state.InvestigateStartedAt = 0
+				state.LastSeenPosition = nil
+				startPatrol()
+			end
+		end
+	end
+
+	tryAutoJump()
+	checkIfStuck()
 end)
 
--- clean up when the npc dies
 humanoid.Died:Connect(function()
-	controller:Destroy()
+	state.Destroyed = true
+	clearMoveConnection()
 end)
