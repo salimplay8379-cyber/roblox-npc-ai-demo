@@ -1,8 +1,8 @@
 -- npc patrol and chase script
--- this script uses a simple state driven update loop
--- patrol chase and investigate each run through their own handler
--- chase movement switches between direct movement and pathfinding based on visibility and range
--- shared recovery logic also rebuilds movement if the npc gets stuck on map geometry
+-- this script runs as a state driven ai controller for one npc
+-- the npc can patrol chase a visible player and investigate the last seen position
+-- the main loop selects the current state handler and then runs shared movement support systems
+-- this layout keeps state logic separated from reusable helpers like pathing jumping and recovery
 
 local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
@@ -15,7 +15,10 @@ local root = npcModel:WaitForChild("HumanoidRootPart")
 local head = npcModel:WaitForChild("Head")
 local patrolFolder = Workspace.PatrolPoints
 
--- config values control detection movement attack timing and recovery behavior
+-- config values tune how far the npc can detect targets
+-- how often movement updates happen
+-- how quickly attacks can fire
+-- and how recovery systems respond when movement fails
 local config = {
 	DetectionRange = 80,
 	AttackRange = 5,
@@ -48,7 +51,9 @@ local config = {
 	InvestigateArriveDistance = 4,
 }
 
--- runtime state keeps the current mode target path and timing data in one place
+-- runtime state stores the live data that changes while the npc is running
+-- this includes the current state target movement path timers and last seen information
+-- keeping this data in one table makes it easier to manage transitions between behaviors
 local state = {
 	Mode = "Patrol",
 	Target = nil,
@@ -84,12 +89,14 @@ local function debugPrint(...)
 	end
 end
 
--- quick validity check used by the heartbeat loop
+-- this is a quick safety check used by the main loop
+-- once the humanoid is dead or the model is removed the rest of the ai should stop running
 local function isAlive()
 	return humanoid.Health > 0 and npcModel.Parent ~= nil
 end
 
--- movement callbacks are replaced often so old connections need to be cleared
+-- movement callbacks are recreated whenever the npc switches paths or states
+-- this helper clears the old callback so only one movement listener stays active at a time
 local function clearMoveConnection()
 	if not state.MoveConnection then
 		return
@@ -99,7 +106,8 @@ local function clearMoveConnection()
 	state.MoveConnection = nil
 end
 
--- resets any active path movement before switching behavior
+-- this fully clears the current path state before a new movement plan begins
+-- it is used when switching between patrol chase investigate and recovery behaviors
 local function stopCurrentPath()
 	clearMoveConnection()
 	state.CurrentPath = nil
@@ -108,7 +116,9 @@ local function stopCurrentPath()
 	humanoid:Move(Vector3.zero)
 end
 
--- returns the character humanoid and root for a valid living player
+-- this returns the main character parts needed by the ai
+-- it filters out missing characters dead characters and characters without a root part
+-- so later systems can assume the returned data is valid
 local function getPlayerParts(player)
 	if not player then
 		return nil
@@ -132,12 +142,16 @@ local function getPlayerParts(player)
 	return character, targetHumanoid, targetRoot
 end
 
--- flattening the target position to the npc Y level keeps chase movement stable when players jump
+-- chase movement only cares about horizontal pursuit
+-- matching the target X and Z while keeping the npc at its own Y level
+-- prevents jumping targets from causing unstable movement or bad path requests
 local function getGroundTargetPosition(position)
 	return Vector3.new(position.X, root.Position.Y, position.Z)
 end
 
--- visibility is based on a raycast from the head so map geometry can block detection
+-- line of sight is checked with a raycast from the npc head toward the target root
+-- this allows walls and other geometry to block detection
+-- so the npc only starts or maintains chase when it can actually see the player
 local function hasLineOfSight(targetRoot)
 	local origin = head.Position + config.SightOffset
 	local direction = targetRoot.Position - origin
@@ -155,7 +169,9 @@ local function hasLineOfSight(targetRoot)
 	return result.Instance:IsDescendantOf(targetRoot.Parent)
 end
 
--- patrol and investigate both reuse this target search
+-- this searches all current players and returns the closest valid visible target
+-- patrol and investigate both use the same search so the npc can re enter chase
+-- whenever a player becomes visible again
 local function findClosestVisiblePlayer()
 	local closestPlayer = nil
 	local closestDistance = config.DetectionRange
@@ -182,7 +198,9 @@ local function findClosestVisiblePlayer()
 	return closestPlayer
 end
 
--- builds a navigation path and returns nil if one cannot be computed
+-- this builds a roblox path from the npc position to a destination
+-- if path computation fails the function returns nil
+-- callers use that result to decide whether they can start path based movement
 local function buildPath(destination)
 	local path = PathfindingService:CreatePath({
 		AgentRadius = 1.5,
@@ -209,12 +227,15 @@ local function buildPath(destination)
 	return path
 end
 
+-- once a path is built this stores the waypoint list that later movement code follows
 local function usePath(path)
 	state.CurrentPath = path
 	state.CurrentWaypoints = path:GetWaypoints()
 	state.CurrentWaypointIndex = 1
 end
 
+-- this advances movement along the current path one waypoint at a time
+-- waypoint jump actions are forwarded to the humanoid before MoveTo is called
 local function moveToNextWaypoint()
 	if #state.CurrentWaypoints == 0 then
 		return
@@ -232,7 +253,9 @@ local function moveToNextWaypoint()
 	humanoid:MoveTo(waypoint.Position)
 end
 
--- small obstacle jump check uses two raycasts to see if the top is clear
+-- this is a support system for small obstacles that pathing may not handle cleanly
+-- it only triggers while grounded and moving forward
+-- and it checks for a low obstacle with free space above before forcing a jump
 local function tryAutoJump()
 	if not config.AutoJumpEnabled then
 		return
@@ -280,6 +303,8 @@ local function tryAutoJump()
 	state.LastJumpTime = time()
 end
 
+-- this changes the current high level ai mode
+-- later the main loop uses the selected mode to choose the correct state handler
 local function setMode(newMode)
 	if state.Mode == newMode then
 		return
@@ -289,6 +314,9 @@ local function setMode(newMode)
 	state.Mode = newMode
 end
 
+-- path following is valid during investigate
+-- and during chase only when chase mode is currently path based
+-- this helper is used by movement callbacks to avoid running stale path logic
 local function isPathMovementMode()
 	if state.Mode == "Investigate" then
 		return true
@@ -301,7 +329,9 @@ local goToPatrolPoint
 local startPatrol
 local startPathChase
 
--- starts path following and advances through waypoints as MoveTo completes
+-- this starts path based movement toward a destination
+-- once the path is active a MoveToFinished callback advances the npc through each waypoint
+-- the callback only continues while the npc is still in a state that should be following that path
 startPathChase = function(destination)
 	local path = buildPath(destination)
 	if not path then
@@ -332,7 +362,9 @@ startPathChase = function(destination)
 	end)
 end
 
--- patrol movement reuses the same path system and advances through patrol points in order
+-- patrol movement uses the same path system as chase and investigate
+-- but its destination comes from the current patrol point instead of a moving target
+-- when one patrol path is finished the npc waits briefly then advances to the next point
 goToPatrolPoint = function()
 	if #state.PatrolPoints == 0 then
 		return
@@ -380,7 +412,10 @@ goToPatrolPoint = function()
 	end)
 end
 
--- patrol is the neutral state and clears chase and investigate data
+-- patrol is the neutral default behavior
+-- entering patrol clears chase specific and investigate specific data
+-- resets movement mode back to path
+-- and begins walking toward the next patrol point
 startPatrol = function()
 	stopCurrentPath()
 
@@ -398,7 +433,9 @@ startPatrol = function()
 	goToPatrolPoint()
 end
 
--- entering chase stores a target and the most recent visible position
+-- chase begins when a visible player is found
+-- this stores the target resets movement tracking and remembers the most recent visible position
+-- so investigate mode has a place to go if the target is lost later
 local function startChase(player)
 	stopCurrentPath()
 
@@ -418,7 +455,8 @@ local function startChase(player)
 	debugPrint("chasing", player.Name)
 end
 
--- investigate sends the npc to the last visible position before it gives up
+-- investigate mode is used after a target is lost
+-- the npc goes to the last visible position and waits there briefly before returning to patrol
 local function startInvestigate(lastPosition)
 	if not config.UseInvestigateMode or not lastPosition then
 		startPatrol()
@@ -438,11 +476,14 @@ local function startInvestigate(lastPosition)
 	startPathChase(lastPosition)
 end
 
+-- this is used by attack logic to enforce cooldown timing between hits
 local function canAttack()
 	return (time() - state.LastAttackTime) >= config.AttackCooldown
 end
 
--- attack is split out so chase logic can focus on movement and state transitions
+-- attack handling is separated from chase movement
+-- this function only applies damage when the target is still valid
+-- in range and off cooldown
 local function attackTarget()
 	if not state.Target then
 		return
@@ -466,7 +507,8 @@ local function attackTarget()
 	debugPrint("attacked", state.Target.Name, "for", config.Damage)
 end
 
--- patrol and investigate can both pick up a fresh target if the npc sees one
+-- patrol and investigate both use this to re acquire a target
+-- if a visible player is found the npc immediately transitions back into chase
 local function checkForTarget()
 	local visiblePlayer = findClosestVisiblePlayer()
 	if visiblePlayer then
@@ -474,7 +516,9 @@ local function checkForTarget()
 	end
 end
 
--- direct chase is used up close so movement feels more responsive than constant repathing
+-- direct chase is the close range movement mode
+-- it skips pathfinding and repeatedly issues MoveTo calls toward a predicted target position
+-- prediction uses the target horizontal velocity so the npc reacts better to motion changes
 local function updateDirectChase(targetRoot, targetGroundPosition)
 	if time() - state.LastRepathTime < config.DirectMoveRefresh then
 		return
@@ -503,7 +547,9 @@ local function updateDirectChase(targetRoot, targetGroundPosition)
 	end
 end
 
--- path chase rebuilds movement less often and is used when the target is farther away or hidden
+-- path chase is the long range or obstructed movement mode
+-- it rebuilds paths at controlled intervals
+-- and avoids rebuilding if the desired chase position is too similar to the current path goal
 local function updatePathChase(targetGroundPosition)
 	if time() - state.LastRepathTime < config.RepathInterval then
 		return
@@ -530,6 +576,9 @@ local function updatePathChase(targetGroundPosition)
 	startPathChase(chasePosition)
 end
 
+-- this decides what happens when chase can no longer continue
+-- if the npc has a last seen position it investigates first
+-- otherwise it returns directly to patrol
 local function loseTargetToInvestigate()
 	if state.LastSeenPosition then
 		startInvestigate(state.LastSeenPosition)
@@ -538,6 +587,8 @@ local function loseTargetToInvestigate()
 	end
 end
 
+-- this switches chase into direct movement mode
+-- the cooldown prevents constant flipping between movement styles
 local function switchToDirectChase()
 	if state.ChaseMode == "Direct" then
 		return
@@ -553,6 +604,8 @@ local function switchToDirectChase()
 	state.LastDirectTargetPosition = nil
 end
 
+-- this switches chase into path movement mode
+-- it also clears path target tracking so the next path rebuild starts clean
 local function switchToPathChase()
 	if state.ChaseMode == "Path" then
 		return
@@ -568,7 +621,10 @@ local function switchToPathChase()
 	state.LastPathTargetPosition = nil
 end
 
--- chase validates the target attacks when in range and decides how movement should be updated
+-- this is the main chase state update
+-- it validates the current target checks chase distance handles attacking
+-- refreshes the last seen position when visibility is clear
+-- and chooses whether movement should be handled by direct chase or path chase
 local function updateChase()
 	if not state.Target then
 		loseTargetToInvestigate()
@@ -612,7 +668,9 @@ local function updateChase()
 	updatePathChase(targetGroundPosition)
 end
 
--- investigate waits briefly at the last seen position before returning to patrol
+-- investigate update runs after the npc reaches the last seen position
+-- it waits for a short time in case the player becomes visible again
+-- then clears the stored location and returns the npc to patrol
 local function updateInvestigate()
 	if not state.LastSeenPosition then
 		startPatrol()
@@ -638,6 +696,9 @@ local function updateInvestigate()
 	startPatrol()
 end
 
+-- this rebuilds chase movement when the npc appears stuck during chase
+-- it chooses direct movement if the target is visible and close
+-- otherwise it rebuilds a path toward the last seen or current target position
 local function recoverChaseMovement()
 	local character, _, targetRoot = getPlayerParts(state.Target)
 	if not character or not targetRoot then
@@ -664,6 +725,7 @@ local function recoverChaseMovement()
 	startPathChase(state.LastSeenPosition or targetGroundPosition)
 end
 
+-- investigate recovery simply rebuilds a path back to the last seen position
 local function recoverInvestigateMovement()
 	if not state.LastSeenPosition then
 		return
@@ -673,6 +735,7 @@ local function recoverInvestigateMovement()
 	startPathChase(state.LastSeenPosition)
 end
 
+-- patrol recovery rebuilds path movement toward the current patrol point
 local function recoverPatrolMovement()
 	if #state.PatrolPoints == 0 then
 		return
@@ -682,7 +745,9 @@ local function recoverPatrolMovement()
 	goToPatrolPoint()
 end
 
--- if the npc stops moving for too long this rebuilds whatever movement mode is active
+-- this checks for low movement over time to detect when the npc is stuck
+-- once the timer passes the threshold it rebuilds movement based on the current state
+-- so patrol chase and investigate each recover in a way that matches their own behavior
 local function checkIfStuck()
 	local movementDelta = (root.Position - state.LastPosition).Magnitude
 
@@ -717,7 +782,9 @@ local function checkIfStuck()
 	state.LastPosition = root.Position
 end
 
--- state handlers keep the heartbeat loop flatter and make the state flow easier to follow
+-- state handlers define the top level logic for each ai mode
+-- the heartbeat loop reads state.Mode and runs the matching handler
+-- this keeps the main loop flatter and avoids a large nested state chain
 local StateHandlers = {}
 
 StateHandlers.Patrol = function()
@@ -733,7 +800,8 @@ StateHandlers.Investigate = function()
 	updateInvestigate()
 end
 
--- patrol points are collected once and sorted by name so the route stays predictable
+-- patrol points are loaded once when the script starts
+-- sorting by name keeps patrol order predictable and easy to control from the workspace
 for _, point in ipairs(patrolFolder:GetChildren()) do
 	if point:IsA("BasePart") then
 		table.insert(state.PatrolPoints, point)
@@ -746,7 +814,11 @@ end)
 
 startPatrol()
 
--- heartbeat runs the active state handler and shared movement helpers every frame
+-- main update loop
+-- this runs every frame and drives the ai system forward
+-- it selects the active state handler first
+-- then runs shared movement support systems that apply across all states
+-- this separation makes the flow easier to follow and debug
 local heartbeatConnection
 heartbeatConnection = RunService.Heartbeat:Connect(function()
 	if not isAlive() then
@@ -765,7 +837,7 @@ heartbeatConnection = RunService.Heartbeat:Connect(function()
 	checkIfStuck()
 end)
 
--- cleanup makes sure old movement callbacks are not left running after death
+-- cleanup is handled on death so movement callbacks do not keep running after the npc is gone
 humanoid.Died:Connect(function()
 	state.Destroyed = true
 	clearMoveConnection()
