@@ -1,4 +1,4 @@
--- npc patrol and chase script
+-- Npc patrol and chase script
 -- this script runs as a state driven ai controller for one npc
 -- the npc can patrol chase a visible player and investigate the last seen position
 -- the main loop selects the current state handler and then runs shared movement support systems
