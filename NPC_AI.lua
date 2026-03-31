@@ -343,14 +343,17 @@ startPathChase = function(destination)
 	moveToNextWaypoint()
 
 	state.MoveConnection = humanoid.MoveToFinished:Connect(function(reached)
+		-- if the npc has been destroyed this old movement callback should stop immediately
 		if state.Destroyed then
 			return
 		end
 
+		-- if the state changed while the path was running this callback is no longer valid
 		if not isPathMovementMode() then
 			return
 		end
 
+		-- only advance to the next waypoint when the last MoveTo actually completed
 		if not reached then
 			return
 		end
@@ -383,10 +386,12 @@ goToPatrolPoint = function()
 	moveToNextWaypoint()
 
 	state.MoveConnection = humanoid.MoveToFinished:Connect(function(reached)
+		-- if the npc died or left patrol mode the patrol callback should stop here
 		if state.Destroyed or state.Mode ~= "Patrol" then
 			return
 		end
 
+		-- patrol should only continue when the current waypoint was actually reached
 		if not reached then
 			return
 		end
@@ -398,6 +403,7 @@ goToPatrolPoint = function()
 		end
 
 		task.delay(config.PatrolWaitTime, function()
+			-- if patrol mode changed during the wait do not keep cycling patrol points
 			if state.Destroyed or state.Mode ~= "Patrol" then
 				return
 			end
@@ -494,10 +500,12 @@ local function attackTarget()
 		return
 	end
 
+	-- if the target is outside melee range damage should not be applied yet
 	if (root.Position - targetRoot.Position).Magnitude > config.AttackRange then
 		return
 	end
 
+	-- cooldown prevents multiple hits from firing every single frame
 	if not canAttack() then
 		return
 	end
@@ -533,6 +541,7 @@ local function updateDirectChase(targetRoot, targetGroundPosition)
 		predictedPosition += flatVelocity * config.DirectPrediction
 	end
 
+	-- if the predicted point barely changed another MoveTo would just create unnecessary updates
 	if state.LastDirectTargetPosition then
 		local moveDelta = (predictedPosition - state.LastDirectTargetPosition).Magnitude
 		if moveDelta < 1.5 then
@@ -542,6 +551,7 @@ local function updateDirectChase(targetRoot, targetGroundPosition)
 
 	state.LastDirectTargetPosition = predictedPosition
 
+	-- only issue direct movement when the predicted point is meaningfully away from the npc
 	if (predictedPosition - root.Position).Magnitude > config.DirectMoveMinDist then
 		humanoid:MoveTo(predictedPosition)
 	end
@@ -551,12 +561,14 @@ end
 -- it rebuilds paths at controlled intervals
 -- and avoids rebuilding if the desired chase position is too similar to the current path goal
 local function updatePathChase(targetGroundPosition)
+	-- repath interval limits how often new paths are requested
 	if time() - state.LastRepathTime < config.RepathInterval then
 		return
 	end
 
 	local chasePosition = state.LastSeenPosition or targetGroundPosition
 
+	-- if the requested chase point barely moved there is no reason to rebuild yet
 	if state.LastPathTargetPosition then
 		local moveDelta = (chasePosition - state.LastPathTargetPosition).Magnitude
 		if moveDelta < config.RepathMinDist then
@@ -564,6 +576,7 @@ local function updatePathChase(targetGroundPosition)
 		end
 	end
 
+	-- if the active path is already leading close enough to the new goal keep the current path
 	if state.CurrentWaypoints and #state.CurrentWaypoints > 0 then
 		local currentGoal = state.CurrentWaypoints[#state.CurrentWaypoints].Position
 		if (currentGoal - chasePosition).Magnitude < config.RepathMinDist then
@@ -626,12 +639,15 @@ end
 -- refreshes the last seen position when visibility is clear
 -- and chooses whether movement should be handled by direct chase or path chase
 local function updateChase()
+	-- if the target disappeared completely the npc can no longer stay in chase
 	if not state.Target then
 		loseTargetToInvestigate()
 		return
 	end
 
 	local character, _, targetRoot = getPlayerParts(state.Target)
+
+	-- if the character data is invalid chase should end before movement code runs on bad data
 	if not character or not targetRoot then
 		debugPrint("lost target because character is invalid")
 		loseTargetToInvestigate()
@@ -640,6 +656,8 @@ local function updateChase()
 
 	local targetGroundPosition = getGroundTargetPosition(targetRoot.Position)
 	local distance = (root.Position - targetGroundPosition).Magnitude
+
+	-- once the target moves outside the allowed chase range the npc gives up and falls back
 	if distance > config.LoseRange then
 		debugPrint("lost target due to distance")
 		loseTargetToInvestigate()
@@ -650,16 +668,20 @@ local function updateChase()
 
 	local hasSight = hasLineOfSight(targetRoot)
 	local wantsDirectChase = hasSight and distance < config.DirectChaseRange
+
+	-- last seen should only update while visibility is clear so investigate goes somewhere meaningful
 	if hasSight then
 		state.LastSeenPosition = targetGroundPosition
 	end
 
+	-- close visible targets can use direct movement while other cases stay on path movement
 	if wantsDirectChase then
 		switchToDirectChase()
 	else
 		switchToPathChase()
 	end
 
+	-- after movement mode is chosen run only the update for that movement style
 	if state.ChaseMode == "Direct" then
 		updateDirectChase(targetRoot, targetGroundPosition)
 		return
@@ -678,15 +700,19 @@ local function updateInvestigate()
 	end
 
 	local distanceToInvestigatePoint = (root.Position - state.LastSeenPosition).Magnitude
+
+	-- stay in investigate until the npc is actually close enough to the stored position
 	if distanceToInvestigatePoint > config.InvestigateArriveDistance then
 		return
 	end
 
+	-- first arrival frame starts the wait timer instead of ending investigate immediately
 	if state.InvestigateStartedAt == 0 then
 		state.InvestigateStartedAt = time()
 		return
 	end
 
+	-- keep waiting until the full investigate delay has passed
 	if time() - state.InvestigateStartedAt < config.InvestigateWaitTime then
 		return
 	end
@@ -751,18 +777,21 @@ end
 local function checkIfStuck()
 	local movementDelta = (root.Position - state.LastPosition).Magnitude
 
+	-- enough movement means the npc is still making progress so the stuck timer should be cleared
 	if movementDelta >= config.StuckThreshold then
 		state.StuckStartTime = nil
 		state.LastPosition = root.Position
 		return
 	end
 
+	-- first frame of very low movement starts the stuck timer
 	if not state.StuckStartTime then
 		state.StuckStartTime = time()
 		state.LastPosition = root.Position
 		return
 	end
 
+	-- low movement has to continue for long enough before recovery should run
 	if time() - state.StuckStartTime < config.StuckTime then
 		state.LastPosition = root.Position
 		return
@@ -770,6 +799,7 @@ local function checkIfStuck()
 
 	debugPrint("npc seems stuck, recalculating")
 
+	-- rebuild movement differently depending on which high level state is currently active
 	if state.Mode == "Chase" and state.Target then
 		recoverChaseMovement()
 	elseif state.Mode == "Investigate" then
@@ -821,6 +851,7 @@ startPatrol()
 -- this separation makes the flow easier to follow and debug
 local heartbeatConnection
 heartbeatConnection = RunService.Heartbeat:Connect(function()
+	-- stop the system entirely once the npc is dead or removed from the world
 	if not isAlive() then
 		state.Destroyed = true
 		clearMoveConnection()
@@ -829,6 +860,8 @@ heartbeatConnection = RunService.Heartbeat:Connect(function()
 	end
 
 	local handler = StateHandlers[state.Mode]
+
+	-- each frame only the handler for the current state should run
 	if handler then
 		handler()
 	end
